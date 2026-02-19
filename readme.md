@@ -2,6 +2,12 @@
 
 A Caddy `tls.issuance` module (`ra_tls`) that produces **RA-TLS certificates** for Confidential Computing.
 
+## Extended certificate
+
+This module will serve an x509 certificate extended with an attribute for the TEE quote. For exemple, for an Intel TDX Confidential VM:
+
+<img width="581" height="624" alt="image" src="https://github.com/user-attachments/assets/28d83c19-b6f0-4f40-9f7d-895d31fe20ce" />
+
 ## Supported Backends
 
 | Backend   | Hardware         | Status    |
@@ -33,7 +39,7 @@ When a TLS client sends a **RATS-TLS nonce** in its ClientHello (per `draft-ietf
 
 This certificate is **not cached** — each challenge produces a unique response.
 
-> **Note:** Go 1.25's `tls.ClientHelloInfo.Extensions` exposes the extension **type IDs** present in the ClientHello, so the module can detect that a RATS-TLS extension was sent. However, the raw extension **payloads** are not available, so the nonce cannot be extracted yet. When the extension is detected without a readable nonce, the module logs a warning and falls back to the deterministic certificate. To fully enable this path, intercept raw ClientHello bytes at the network layer or wait for Go to expose raw extension data.
+> **Note:** Go 1.25's `tls.ClientHelloInfo.Extensions` exposes the extension **type IDs** present in the ClientHello, so the module can detect that a RATS-TLS extension was sent. However, the raw extension **payloads** are not available, so the nonce cannot be extracted yet. When the extension is detected without a readable nonce, the module logs a warning and falls back to the deterministic certificate. We are working on a Go `crypto/tls` fork and plan to submit an upstream PR to expose raw extension data.
 
 ## Requirements
 
@@ -49,9 +55,13 @@ This certificate is **not cached** — each challenge produces a unique response
 # Install xcaddy
 go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-# Build Caddy with the RA-TLS module
+# Clone the module (or your fork) and build from the local directory
+git clone https://github.com/Privasys/caddy-ra-tls-module.git
+cd caddy-ra-tls-module
 xcaddy build --with github.com/Privasys/caddy-ra-tls-module=.
 ```
+
+> **Note:** The `=.` suffix tells xcaddy to use the local directory as the module source. The import path before `=` must match the `module` directive in `go.mod`. If you are working from a fork, update `go.mod` accordingly.
 
 ## Caddyfile Usage
 
@@ -92,6 +102,34 @@ example.com {
     }
   }
 }
+```
+
+## Inspecting the Certificate
+
+Once Caddy is running, inspect the RA-TLS certificate with standard tools:
+
+```bash
+# Retrieve and display the full certificate
+echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null \
+  | openssl x509 -noout -text
+```
+
+Look for the TDX quote in the X.509 extensions:
+
+```
+X509v3 extensions:
+    ...
+    1.2.840.113741.1.5.5.1.6:
+        <hex dump of the TDX quote — ~8000 bytes of attestation evidence>
+```
+
+To save the certificate for programmatic verification:
+
+```bash
+echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null \
+  | openssl x509 -outform PEM > ratls-cert.pem
+
+openssl asn1parse -in ratls-cert.pem
 ```
 
 ## Key Sensitivity
