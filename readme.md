@@ -31,7 +31,7 @@ Certificates are cached by certmagic and auto-renewed. A verifier reproduces the
 
 ### Challenge-Response (GetCertificate path)
 
-When a TLS client sends a **RATS-TLS nonce** in its ClientHello (per `draft-ietf-rats-tls-attestation`):
+When a TLS client sends a **RA-TLS challenge** in its ClientHello (extension `0xffbb`):
 
 1. **Ephemeral Key** — A fresh ECDSA P-256 key pair is generated.
 2. **Attestation** — `ReportData = SHA-512( SHA-256(DER public key) || nonce )`, binding the quote to the client's challenge.
@@ -39,7 +39,7 @@ When a TLS client sends a **RATS-TLS nonce** in its ClientHello (per `draft-ietf
 
 This certificate is **not cached** — each challenge produces a unique response.
 
-> **Note:** Go 1.25's `tls.ClientHelloInfo.Extensions` exposes the extension **type IDs** present in the ClientHello, so the module can detect that a RATS-TLS extension was sent. However, the raw extension **payloads** are not available, so the nonce cannot be extracted yet. When the extension is detected without a readable nonce, the module logs a warning and falls back to the deterministic certificate. We are working on a Go `crypto/tls` fork and plan to submit an upstream PR to expose raw extension data.
+> **Note:** This branch requires the [Privasys/go fork](https://github.com/Privasys/go/tree/ratls) which adds `ClientHelloInfo.RATLSChallenge` to `crypto/tls`, enabling challenge-response attestation. An upstream PR is open at [golang/go#77714](https://github.com/golang/go/pull/77714). The code references `hello.RATLSChallenge` directly and **will not compile with standard Go**.
 
 ## Requirements
 
@@ -47,15 +47,24 @@ This certificate is **not cached** — each challenge produces a unique response
 - Backend-specific support:
   - `tdx` — Kernel configfs-tsm (`/sys/kernel/config/tsm/report`)
 - An **intermediary CA** certificate and private key (private PKI)
-- Go 1.25+ and [xcaddy](https://github.com/caddyserver/xcaddy)
+- [Privasys/go fork](https://github.com/Privasys/go/tree/ratls) (`ratls` branch) and [xcaddy](https://github.com/caddyserver/xcaddy)
 
 ## Building
 
+First, build the Go fork:
+
 ```bash
-# Install xcaddy
+git clone -b ratls https://github.com/Privasys/go.git ~/go-ratls
+cd ~/go-ratls/src && ./make.bash
+export GOROOT=~/go-ratls
+export PATH=$GOROOT/bin:$PATH
+```
+
+Then build Caddy with the RA-TLS module:
+
+```bash
 go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-# Clone the module (or your fork) and build from the local directory
 git clone https://github.com/Privasys/caddy-ra-tls-module.git
 cd caddy-ra-tls-module
 xcaddy build --with github.com/Privasys/caddy-ra-tls-module=.

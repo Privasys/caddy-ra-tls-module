@@ -53,11 +53,13 @@
 //     reproduces the ReportData from the certificate's public key and NotBefore.
 //
 //   - Challenge-Response (GetCertificate path): When the client's TLS
-//     ClientHello contains a RATS-TLS nonce extension (per
-//     draft-ietf-rats-tls-attestation), a fresh ephemeral certificate is
-//     generated with ReportData = SHA-512(SHA-256(pubkey) || nonce). This
-//     certificate is not cached. Requires a TLS implementation that exposes
-//     raw ClientHello extensions (see extractRATSNonce).
+//     ClientHello contains a RA-TLS challenge extension (0xffbb), a fresh
+//     ephemeral certificate is generated with
+//     ReportData = SHA-512(SHA-256(pubkey) || nonce). This certificate is
+//     not cached. To read the challenge payload, build with the Privasys/go
+//     fork (https://github.com/Privasys/go/tree/ratls) and the "ratls" build
+//     tag. With standard Go the extension is detected but the payload cannot
+//     be read, so the module falls back to the deterministic certificate.
 //
 // # Private Key Sensitivity
 //
@@ -128,7 +130,7 @@ const reportTimeFormat = "2006-01-02T15:04Z"
 // It implements:
 //   - certmagic.KeyGenerator -- generates ECDSA P-256 key pairs.
 //   - certmagic.Issuer       -- issues CA-signed certificates with embedded attestation evidence.
-//   - certmagic.Manager      -- serves challenge-response certs for RATS-TLS clients.
+//   - certmagic.Manager      -- serves challenge-response certs for RA-TLS clients.
 //   - caddy.Provisioner      -- verifies hardware availability and loads the CA.
 //   - caddyfile.Unmarshaler  -- parses the "ra_tls" Caddyfile directive.
 type RATLSIssuer struct {
@@ -403,27 +405,30 @@ func (iss *RATLSIssuer) IssuerKey() string {
 // ---------------------------------------------------------------------------
 
 // GetCertificate implements certmagic.Manager. It inspects the TLS
-// ClientHello for a RATS-TLS attestation nonce. If present, it generates
-// a fresh ephemeral certificate with attestation evidence bound to the
-// client's nonce -- providing interactive, challenge-response attestation.
+// ClientHello for a RA-TLS challenge extension (0xffbb). If present and the
+// challenge payload is available (requires the Privasys/go fork + "ratls"
+// build tag), it generates a fresh ephemeral certificate with attestation
+// evidence bound to the client's nonce — providing interactive,
+// challenge-response attestation.
 //
-// If no RATS-TLS nonce is found in the ClientHello, it returns (nil, nil)
-// to let certmagic serve a pre-issued certificate from the Issue() path.
+// If no RA-TLS challenge is found, or if the extension is detected but the
+// payload is unavailable (standard Go), it returns (nil, nil) to let
+// certmagic serve a pre-issued certificate from the Issue() path.
 func (iss *RATLSIssuer) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	nonce, found := extractRATSNonce(hello)
+	nonce, found := extractRATLSChallenge(hello)
 	if !found {
 		return nil, nil
 	}
 
 	if nonce == nil {
-		iss.logger.Warn("RATS-TLS extension detected in ClientHello but nonce payload "+
-			"is unavailable (Go crypto/tls only exposes extension IDs); "+
+		iss.logger.Warn("RA-TLS challenge extension detected in ClientHello but payload "+
+			"is unavailable (build with the Privasys/go fork and -tags ratls to enable); "+
 			"falling back to deterministic certificate",
 			zap.String("server_name", hello.ServerName))
 		return nil, nil
 	}
 
-	iss.logger.Info("RATS-TLS nonce detected in ClientHello, generating challenge-response certificate",
+	iss.logger.Info("RA-TLS challenge detected in ClientHello, generating challenge-response certificate",
 		zap.String("server_name", hello.ServerName),
 		zap.Int("nonce_bytes", len(nonce)))
 
@@ -492,7 +497,7 @@ func (iss *RATLSIssuer) GetCertificate(ctx context.Context, hello *tls.ClientHel
 		return nil, fmt.Errorf("ra_tls: failed to build TLS certificate: %w", err)
 	}
 
-	iss.logger.Info("RATS-TLS challenge-response certificate generated",
+	iss.logger.Info("RA-TLS challenge-response certificate generated",
 		zap.String("backend", iss.attester.Name()),
 		zap.String("server_name", hello.ServerName),
 		zap.Int("quote_bytes", len(rawQuote)))
@@ -583,37 +588,27 @@ func (iss *RATLSIssuer) encodeChainPEM(leafDER []byte) []byte {
 	return chain
 }
 
-// ratsEvidenceRequestExtType is the TLS extension type for the RATS-TLS
-// evidence_request extension defined in draft-ietf-rats-tls-attestation.
+// ratlsExtType is the TLS extension type for the RA-TLS challenge extension.
+// This matches the temporary value (0xffbb) used in the Privasys/go fork
+// (https://github.com/Privasys/go/tree/ratls).
 // Replace with the IANA-assigned value once allocated.
-const ratsEvidenceRequestExtType uint16 = 0xFF01 // TODO: replace with IANA assignment
+const ratlsExtType uint16 = 0xffbb // TODO: replace with IANA assignment
 
-// extractRATSNonce inspects the ClientHello for a RATS-TLS attestation
-// nonce extension (per draft-ietf-rats-tls-attestation).
+// extractRATLSChallenge inspects the ClientHello for a RA-TLS challenge extension.
 //
-// Go 1.25's tls.ClientHelloInfo.Extensions field lists the extension type
-// IDs present in the ClientHello, so we can detect whether the RATS-TLS
-// extension was sent. However, it does NOT expose the raw extension
-// payloads -- only the IDs. Therefore we can tell *that* the client
-// requested attestation, but cannot read the nonce value.
+// This implementation requires the Privasys/go fork
+// (https://github.com/Privasys/go/tree/ratls) which adds
+// tls.ClientHelloInfo.RATLSChallenge — the raw challenge bytes from the
+// RA-TLS extension (0xffbb). The fork validates the payload length (8–64
+// bytes) during handshake parsing; if malformed, the handshake is rejected
+// before we get here.
 //
-// To fully enable challenge-response attestation, either:
-//   - Intercept the raw ClientHello bytes at the network layer (e.g. via
-//     a custom net.Listener that tees the first flight), or
-//   - Wait for Go to add raw extension data to tls.ClientHelloInfo, or
-//   - Use a TLS library that exposes raw extensions.
-func extractRATSNonce(hello *tls.ClientHelloInfo) (nonce []byte, found bool) {
-	for _, ext := range hello.Extensions {
-		if ext == ratsEvidenceRequestExtType {
-			// The extension ID is present, but we cannot read its payload
-			// from tls.ClientHelloInfo. Return found=true with a nil nonce
-			// to signal the caller that challenge-response was requested
-			// but data extraction is not yet implemented.
-			//
-			// TODO: Once raw extension data is available, parse the nonce
-			// from the evidence_request extension payload here.
-			return nil, true
-		}
+// Build with:
+//
+//	GOROOT=~/go-ratls xcaddy build -tags ratls --with ...
+func extractRATLSChallenge(hello *tls.ClientHelloInfo) (nonce []byte, found bool) {
+	if len(hello.RATLSChallenge) > 0 {
+		return hello.RATLSChallenge, true
 	}
 	return nil, false
 }
