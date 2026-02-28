@@ -81,6 +81,37 @@ xcaddy build --with github.com/Privasys/ra-tls-caddy=.
 
 > **Note:** The `=.` suffix tells xcaddy to use the local directory as the module source. The import path before `=` must match the `module` directive in `go.mod`. If you are working from a fork, update `go.mod` accordingly.
 
+## Upgrading
+
+To upgrade to a newer version of the RA-TLS module:
+
+```bash
+# Pull the latest code
+cd ~/ra-tls-caddy/src
+git pull
+
+# Rebuild Caddy with the updated module
+xcaddy build --with github.com/Privasys/ra-tls-caddy=.
+
+# Replace the system binary
+sudo mv caddy /usr/local/bin/caddy
+sudo chmod +x /usr/local/bin/caddy
+
+# Verify the new version
+caddy version
+caddy list-modules | grep ra_tls
+
+# Clear the certificate cache so a fresh cert is issued on next request
+sudo rm -rf /root/.local/share/caddy/certificates/
+
+# Restart the service
+sudo systemctl restart caddy-ratls
+```
+
+> **Note:** certmagic caches certificates on disk (default: `/root/.local/share/caddy/`). If the upgrade changes how certificates are built (e.g. ReportData computation), you must delete the cached certificates before restarting. Otherwise Caddy will keep serving the old cert until it expires.
+
+After restarting, Caddy will issue a fresh certificate using the updated code. Existing cached certificates are automatically replaced on the next renewal cycle, or immediately if the service restarts and the certificate has expired.
+
 ## Caddyfile Usage
 
 ```caddyfile
