@@ -226,12 +226,14 @@ A relying party verifying an RA-TLS certificate should:
 
 This project makes use of the following open source libraries:
 
-- [Caddy v2](https://github.com/caddyserver/caddy) ([Apache 2.0 License](https://github.com/caddyserver/caddy/blob/master/LICENSE))
-- [CertMagic](https://github.com/caddyserver/certmagic) ([Apache 2.0 License](https://github.com/caddyserver/certmagic/blob/master/LICENSE))
-- [go-tdx-guest](https://github.com/google/go-tdx-guest) ([Apache 2.0 License](https://github.com/google/go-tdx-guest/blob/main/LICENSE))
-- [Uber Zap](https://github.com/uber-go/zap) ([MIT License](https://github.com/uber-go/zap/blob/master/LICENSE.txt))
+| Library | License | Usage |
+|---------|---------|-------|
+| [Caddy v2](https://github.com/caddyserver/caddy) | Apache 2.0 | HTTP server framework and plugin host |
+| [CertMagic](https://github.com/caddyserver/certmagic) | Apache 2.0 | Automatic certificate management |
+| [go-tdx-guest](https://github.com/google/go-tdx-guest) | Apache 2.0 | TDX quote parsing and signature verification |
+| [Uber Zap](https://github.com/uber-go/zap) | MIT | Structured logging |
 
-Please refer to each project for their respective license terms.
+Full license texts are in [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).
 
 ## Contributing
 
