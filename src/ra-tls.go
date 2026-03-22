@@ -101,10 +101,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -145,6 +149,12 @@ type RATLSIssuer struct {
 	// CAKeyPath is the path to the PEM-encoded private key of the
 	// intermediary CA.
 	CAKeyPath string `json:"ca_key_path"`
+
+	// ExtensionsDir is the directory containing per-hostname OID extension
+	// files (<hostname>.json). Each file is a JSON array of {oid, value}
+	// objects that are added to the certificate alongside the attestation
+	// quote. Written by the workload manager.
+	ExtensionsDir string `json:"extensions_dir,omitempty"`
 
 	// attester is the hardware-specific attestation provider, created from
 	// the Backend configuration during Provision.
@@ -343,6 +353,19 @@ func (iss *RATLSIssuer) Issue(ctx context.Context, csr *x509.CertificateRequest)
 		return nil, fmt.Errorf("ra_tls: serial number generation failed: %w", err)
 	}
 
+	extraExts := []pkix.Extension{
+		iss.attester.CertExtension(rawQuote),
+	}
+
+	// Load per-hostname OID extensions from the extensions directory.
+	if len(csr.DNSNames) > 0 {
+		hostExts, err := iss.loadHostnameExtensions(csr.DNSNames[0])
+		if err != nil {
+			return nil, err
+		}
+		extraExts = append(extraExts, hostExts...)
+	}
+
 	template := &x509.Certificate{
 		SerialNumber:   serialNumber,
 		Subject:        csr.Subject,
@@ -361,9 +384,7 @@ func (iss *RATLSIssuer) Issue(ctx context.Context, csr *x509.CertificateRequest)
 		},
 		BasicConstraintsValid: true,
 
-		ExtraExtensions: []pkix.Extension{
-			iss.attester.CertExtension(rawQuote),
-		},
+		ExtraExtensions: extraExts,
 	}
 
 	// -- 7. Sign with the intermediary CA and encode the PEM chain
@@ -398,6 +419,89 @@ func (iss *RATLSIssuer) IssuerKey() string {
 		return "ra_tls_" + iss.Backend
 	}
 	return "ra_tls"
+}
+
+// extensionEntry matches the JSON format written by the workload manager.
+type extensionEntry struct {
+	OID   string `json:"oid"`
+	Value string `json:"value"` // base64-encoded DER value
+}
+
+// loadHostnameExtensions reads <extensions_dir>/<hostname>.json and returns
+// the entries as pkix.Extension values. Returns nil (no error) when the
+// extensions directory is not configured or the file does not exist.
+func (iss *RATLSIssuer) loadHostnameExtensions(hostname string) ([]pkix.Extension, error) {
+	if iss.ExtensionsDir == "" {
+		return nil, nil
+	}
+	path := filepath.Join(iss.ExtensionsDir, hostname+".json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("ra_tls: read extensions file %q: %w", path, err)
+	}
+
+	var entries []extensionEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("ra_tls: parse extensions file %q: %w", path, err)
+	}
+
+	exts := make([]pkix.Extension, 0, len(entries))
+	for _, e := range entries {
+		oid, err := parseOID(e.OID)
+		if err != nil {
+			return nil, fmt.Errorf("ra_tls: invalid OID %q in %q: %w", e.OID, path, err)
+		}
+		val, err := base64.StdEncoding.DecodeString(e.Value)
+		if err != nil {
+			return nil, fmt.Errorf("ra_tls: invalid base64 for OID %s in %q: %w", e.OID, path, err)
+		}
+		exts = append(exts, pkix.Extension{
+			Id:    oid,
+			Value: val,
+		})
+	}
+
+	iss.logger.Debug("loaded hostname extensions",
+		zap.String("hostname", hostname),
+		zap.Int("count", len(exts)))
+	return exts, nil
+}
+
+// parseOID converts a dot-notation OID string into an asn1.ObjectIdentifier.
+func parseOID(s string) (asn1.ObjectIdentifier, error) {
+	var oid asn1.ObjectIdentifier
+	for _, part := range splitDots(s) {
+		n := 0
+		for _, c := range part {
+			if c < '0' || c > '9' {
+				return nil, fmt.Errorf("non-numeric component %q", part)
+			}
+			n = n*10 + int(c-'0')
+		}
+		oid = append(oid, n)
+	}
+	if len(oid) < 2 {
+		return nil, fmt.Errorf("too few components")
+	}
+	return oid, nil
+}
+
+// splitDots splits a string by '.'.
+func splitDots(s string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || s[i] == '.' {
+			if i > start {
+				parts = append(parts, s[start:i])
+			}
+			start = i + 1
+		}
+	}
+	return parts
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +561,17 @@ func (iss *RATLSIssuer) GetCertificate(ctx context.Context, hello *tls.ClientHel
 		return nil, fmt.Errorf("ra_tls: serial number generation failed: %w", err)
 	}
 
+	crExtraExts := []pkix.Extension{
+		iss.attester.CertExtension(rawQuote),
+	}
+
+	// Load per-hostname OID extensions from the extensions directory.
+	hostExts, err := iss.loadHostnameExtensions(hello.ServerName)
+	if err != nil {
+		return nil, err
+	}
+	crExtraExts = append(crExtraExts, hostExts...)
+
 	now := time.Now().UTC()
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
@@ -473,9 +588,7 @@ func (iss *RATLSIssuer) GetCertificate(ctx context.Context, hello *tls.ClientHel
 		},
 		BasicConstraintsValid: true,
 
-		ExtraExtensions: []pkix.Extension{
-			iss.attester.CertExtension(rawQuote),
-		},
+		ExtraExtensions: crExtraExts,
 	}
 
 	// -- Sign with the intermediary CA ------------------------
@@ -540,6 +653,11 @@ func (iss *RATLSIssuer) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.ArgErr()
 			}
 			iss.CAKeyPath = d.Val()
+		case "extensions_dir":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			iss.ExtensionsDir = d.Val()
 		default:
 			return d.Errf("unrecognised sub-directive: %s", d.Val())
 		}
