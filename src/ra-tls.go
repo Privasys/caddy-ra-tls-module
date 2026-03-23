@@ -120,6 +120,7 @@ import (
 
 func init() {
 	caddy.RegisterModule(RATLSIssuer{})
+	caddy.RegisterModule(RATLSCertGetter{})
 }
 
 // reportTimeFormat is the deterministic format used when encoding the
@@ -744,6 +745,187 @@ func pubKeyFingerprint(pub *ecdsa.PublicKey) (string, error) {
 }
 
 // ---------------------------------------------------------------------------
+// tls.get_certificate.ra_tls — Manager wrapper for challenge-response
+// ---------------------------------------------------------------------------
+
+// RATLSCertGetter is a Caddy certificate manager module that handles ALL
+// RA-TLS certificate generation, both challenge-response and deterministic.
+//
+// It is registered under the "tls.get_certificate" namespace so that Caddy
+// calls GetCertificate on every TLS handshake (when no certmagic-cached cert
+// exists). When used as the sole source of certificates (without issuers),
+// it guarantees that challenge-bearing connections always receive a fresh cert
+// bound to the client's nonce.
+//
+// For non-challenge connections, an internal cache keyed by SNI avoids
+// regenerating the TDX quote on every handshake. Cached certs are evicted
+// when they reach 80% of their lifetime.
+type RATLSCertGetter struct {
+	RATLSIssuer
+
+	mu    sync.RWMutex
+	cache map[string]*cachedCert
+}
+
+// cachedCert holds a TLS certificate with its expiry for cache eviction.
+type cachedCert struct {
+	cert     *tls.Certificate
+	notAfter time.Time
+}
+
+// CaddyModule returns the Caddy module information for the cert getter.
+func (RATLSCertGetter) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "tls.get_certificate.ra_tls",
+		New: func() caddy.Module { return new(RATLSCertGetter) },
+	}
+}
+
+// Provision delegates to the embedded RATLSIssuer and initialises the cache.
+func (g *RATLSCertGetter) Provision(ctx caddy.Context) error {
+	g.cache = make(map[string]*cachedCert)
+	return g.RATLSIssuer.Provision(ctx)
+}
+
+// GetCertificate implements certmagic.Manager. It handles both attestation
+// modes:
+//
+//   - Challenge-response: if hello.RATLSChallenge is set, a fresh ephemeral
+//     certificate is generated with ReportData bound to the client's nonce.
+//     These certs are never cached.
+//
+//   - Deterministic: if no challenge is present, a certificate with
+//     ReportData = SHA-512(SHA-256(pubkey) || time) is generated (or served
+//     from cache if still valid).
+func (g *RATLSCertGetter) GetCertificate(ctx context.Context, hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	// Challenge connections always get a fresh cert.
+	nonce, found := extractRATLSChallenge(hello)
+	if found && nonce != nil {
+		return g.RATLSIssuer.GetCertificate(ctx, hello)
+	}
+
+	// Non-challenge: check internal cache.
+	sni := hello.ServerName
+	g.mu.RLock()
+	if c, ok := g.cache[sni]; ok {
+		// Serve cached cert if it still has >20% of its lifetime remaining.
+		remaining := time.Until(c.notAfter)
+		if remaining > 0 {
+			g.mu.RUnlock()
+			return c.cert, nil
+		}
+	}
+	g.mu.RUnlock()
+
+	// Generate a deterministic RA-TLS certificate.
+	cert, notAfter, err := g.issueDeterministic(hello)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache it.
+	g.mu.Lock()
+	g.cache[sni] = &cachedCert{cert: cert, notAfter: notAfter}
+	g.mu.Unlock()
+
+	return cert, nil
+}
+
+// issueDeterministic generates a deterministic RA-TLS certificate for a
+// non-challenge connection. The ReportData binding is
+// SHA-512(SHA-256(pubkey) || creation_time) where creation_time is the
+// NotBefore value truncated to 1-minute precision.
+func (g *RATLSCertGetter) issueDeterministic(hello *tls.ClientHelloInfo) (*tls.Certificate, time.Time, error) {
+	// Generate ephemeral ECDSA P-256 key pair.
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("ra_tls: ephemeral key generation failed: %w", err)
+	}
+
+	// ReportData = SHA-512(SHA-256(pubkey) || creation_time).
+	pubKeyDER, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("ra_tls: failed to marshal public key: %w", err)
+	}
+	creationTime := time.Now().UTC().Truncate(time.Minute)
+	creationTimeStr := creationTime.Format(reportTimeFormat)
+	reportData := computeReportData(pubKeyDER, []byte(creationTimeStr))
+
+	// Generate attestation evidence.
+	rawQuote, err := g.attester.Quote(reportData)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("ra_tls[%s]: %w", g.attester.Name(), err)
+	}
+
+	g.logger.Info("attestation evidence generated",
+		zap.String("backend", g.attester.Name()),
+		zap.Int("quote_bytes", len(rawQuote)),
+		zap.String("creation_time", creationTimeStr),
+		zap.String("report_data_algo", "SHA-512(SHA-256(pubkey) || time)"))
+
+	// Build certificate template.
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("ra_tls: serial number generation failed: %w", err)
+	}
+
+	extraExts := []pkix.Extension{
+		g.attester.CertExtension(rawQuote),
+	}
+	hostExts, err := g.loadHostnameExtensions(hello.ServerName)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	extraExts = append(extraExts, hostExts...)
+
+	notAfter := creationTime.Add(24 * time.Hour)
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: hello.ServerName,
+		},
+		DNSNames:  []string{hello.ServerName},
+		NotBefore: creationTime,
+		NotAfter:  notAfter,
+
+		KeyUsage: x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageServerAuth,
+		},
+		BasicConstraintsValid: true,
+
+		ExtraExtensions: extraExts,
+	}
+
+	// Sign with the intermediary CA.
+	certDER, err := g.signCertificate(template, &privKey.PublicKey)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	chainPEM := g.encodeChainPEM(certDER)
+
+	// Build tls.Certificate.
+	keyDER, err := x509.MarshalECPrivateKey(privKey)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("ra_tls: failed to marshal private key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	tlsCert, err := tls.X509KeyPair(chainPEM, keyPEM)
+	if err != nil {
+		return nil, time.Time{}, fmt.Errorf("ra_tls: failed to build TLS certificate: %w", err)
+	}
+
+	g.logger.Info("RA-TLS certificate issued (CA-signed)",
+		zap.String("backend", g.attester.Name()),
+		zap.String("server_name", hello.ServerName),
+		zap.String("not_before", creationTimeStr),
+		zap.Time("not_after", notAfter))
+
+	return &tlsCert, notAfter, nil
+}
+
+// ---------------------------------------------------------------------------
 // Interface guards -- these are compile-time assertions.
 // ---------------------------------------------------------------------------
 
@@ -754,4 +936,8 @@ var (
 	_ certmagic.KeyGenerator = (*RATLSIssuer)(nil)
 	_ certmagic.Manager      = (*RATLSIssuer)(nil)
 	_ caddyfile.Unmarshaler  = (*RATLSIssuer)(nil)
+
+	_ caddy.Module      = (*RATLSCertGetter)(nil)
+	_ caddy.Provisioner = (*RATLSCertGetter)(nil)
+	_ certmagic.Manager = (*RATLSCertGetter)(nil)
 )
