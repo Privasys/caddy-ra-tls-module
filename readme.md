@@ -26,7 +26,7 @@ The module supports two attestation paths:
 ### Deterministic (Issue path)
 
 1. **Key Generation** — An ECDSA P-256 key pair is generated inside the TEE.
-2. **Attestation** — We chose that `ReportData = SHA-512( SHA-256(DER public key) || creation_time )`, where `creation_time` is `NotBefore` truncated to 1-minute precision (`"2006-01-02T15:04Z"`). The quote is obtained from the configured backend.
+2. **Attestation** — We chose that `ReportData = SHA-512( SHA-256(SPKI_DER) || creation_time )`, where `SPKI_DER` is the 91-byte DER-encoded `SubjectPublicKeyInfo` of the leaf public key (the same structure whose SHA-256 appears as "Public Key SHA-256" in standard X.509 certificate viewers), and `creation_time` is `NotBefore` truncated to 1-minute precision (`"2006-01-02T15:04Z"`). The quote is obtained from the configured backend.
 3. **Certificate** — An X.509 certificate is signed by a user-provided **intermediary CA** (private PKI), embedding the attestation evidence in a backend-specific extension OID. The PEM output includes the full chain (leaf + CA cert).
 
 Certificates are cached by certmagic and auto-renewed. A verifier reproduces the ReportData from the certificate alone.
@@ -36,7 +36,7 @@ Certificates are cached by certmagic and auto-renewed. A verifier reproduces the
 When a TLS client sends a **RA-TLS challenge** in its ClientHello (extension `0xffbb`):
 
 1. **Ephemeral Key** — A fresh ECDSA P-256 key pair is generated.
-2. **Attestation** — `ReportData = SHA-512( SHA-256(DER public key) || nonce )`, binding the quote to the client's challenge.
+2. **Attestation** — `ReportData = SHA-512( SHA-256(SPKI_DER) || nonce )`, binding the quote to the client's challenge.
 3. **Certificate** — A very short-lived (5 min) certificate is signed by the same CA, with the quote embedded.
 
 This certificate is **not cached** — each challenge produces a unique response.
